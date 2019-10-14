@@ -1,4 +1,12 @@
-#include "zstd.h"
+#ifndef ZSTD_STATIC_LINKING_ONLY
+#define ZSTD_STATIC_LINKING_ONLY
+#endif
+#ifndef ZDICT_STATIC_LINKING_ONLY
+#define ZDICT_STATIC_LINKING_ONLY
+#endif
+
+#include "zstd-finalnewpath/lib/zstd.h"
+#include <algorithm>
 #include <dirent.h>
 #include <fstream>
 #include <iostream>
@@ -13,50 +21,51 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
-#include <algorithm>
-
-// g++ -std=c++11 benchmark.cpp zstd-baseline/lib/libzstd.a
+#include <thread>
+// g++ -std=c++11 benchmark.cpp zstd-baseline/lib/libzstd.a -o zstdbase && g++ -std=c++11 benchmark.cpp zstd-finalnewpath/lib/libzstd.a -o zstdnew
 
 using namespace std;
 
 vector<string> BASEFILES = {
-  /*"dickens",
-  "mozilla",
-  "mr",
-  "nci",
-  "ooffice",
-  "osdb",
-  "samba",
-  "reymont",*/
-  "webster",
-  //"sao",
-  //"xml",
-  //"x-ray"
+    "dickens",
+    "mozilla",
+    "mr",
+    "nci",
+    "ooffice",
+    "osdb",
+    "samba",
+    "reymont",
+    "webster",
+    "sao",
+    "xml",
+    "x-ray"
 };
 vector<int> DICTSIZES = {
-     2000,
-    // 8000,
-    // 16000,
-    // 32000,  48000,
-    // 64000,
-    // 86000,
+    2000,
+    8000,
+    16000,
+    32000,
+    48000,
+    64000,
+    86000,
     112640,
-    // 140000, 180000
+    140000,
+    180000
 };
-vector<int> COMPLEVELS = {-1};
+vector<int> COMPLEVELS = {1, 2, 3, 4, 5};
 
-// in kilobytes
 vector<int> FILESIZES = {
-  64000,
-  //128000,
-  //256000,
-  //512000,
-  //1000000,
-  //2000000,
-  4000000,
-  //6000000,
+    16000,
+    32000,
+    64000,
+    128000,
+    256000,
+    512000,
+    1000000,
+    2000000,
+    4000000,
+    6000000
 };
-
 
 namespace std {
 
@@ -64,7 +73,6 @@ template <class T> inline void hash_combine(std::size_t &seed, T const &v) {
   seed ^= hash<T>()(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
 }
 
-// Recursive template code derived from Matthieu M.
 template <class Tuple, size_t Index = std::tuple_size<Tuple>::value - 1>
 struct HashValueImpl {
   static void apply(size_t &seed, Tuple const &tuple) {
@@ -88,19 +96,53 @@ template <typename... TT> struct hash<std::tuple<TT...>> {
 };
 } // namespace std
 
+struct BenchContext{
+  char** fileNames;
+  size_t nbFileNames;
+  void** dstBuffers;
+  size_t* dstCapacities;
+  void** srcBuffers;
+  size_t* srcSizes;
+  size_t totalSrcSize;
+};
+
 struct Stats {
-  Stats(double mean, double median, double stddev)
-      : mean(mean), median(median), stddev(stddev) {}
+  Stats(double mean, double median, double stddev, double ci)
+      : mean(mean), median(median), stddev(stddev), ci(ci) {}
   double mean;
   double median;
   double stddev;
-  void print() {
-    cout << "mean: " << mean << " stddev: " << stddev << endl;
-  }
+  double ci;
+  void print() { cout << "mean: " << mean << " stddev: " << stddev << " ci: " << ci << endl; }
 };
 
+void printStats(vector<Stats> stats, bool verbose) {
+  for (int i = 0; i < stats.size(); ++i) {
+    if (i == 0 && verbose) {
+      cout << "compressedSize: ";
+      stats[i].print();
+    } else if (i == 1 && verbose) {
+      cout << "srcSize: ";
+      stats[i].print();
+    } else if (i == 2) {
+      cout << "timeSpent: ";
+      stats[i].print();
+    } else if (i == 3) {
+      cout << "MBPS: ";
+      stats[i].print();
+    } else if (i == 4) {
+      cout << "RATIO: ";
+      stats[i].print();
+    }
+  }
+}
+
 // stats are 0: compressed size, 1: src size, 2, time to compress
-vector<Stats> computeStats(const vector<double>& compressedSizes, const vector<double>& srcSizes, const vector<double>& allTimes, const vector<double>& mbpses, const vector<double>& ratios) {
+vector<Stats> computeStats(const vector<double> &compressedSizes,
+                           const vector<double> &srcSizes,
+                           const vector<double> &allTimes,
+                           const vector<double> &mbpses,
+                           const vector<double> &ratios) {
   vector<vector<double>> thingstocompute;
   vector<Stats> ret;
   thingstocompute.push_back(compressedSizes);
@@ -109,27 +151,28 @@ vector<Stats> computeStats(const vector<double>& compressedSizes, const vector<d
   thingstocompute.push_back(mbpses);
   thingstocompute.push_back(ratios);
 
-  for (auto& v : thingstocompute) {
+  for (auto &v : thingstocompute) {
     double sum = std::accumulate(v.begin(), v.end(), 0.0);
     double mean = sum / v.size();
     std::vector<double> diff(v.size());
-    std::transform(v.begin(), v.end(), diff.begin(), [mean](double x) { return x - mean; });
-    double sq_sum = std::inner_product(diff.begin(), diff.end(), diff.begin(), 0.0);
-    double stdev = std::sqrt(sq_sum / v.size());
-
+    std::transform(v.begin(), v.end(), diff.begin(),
+                   [mean](double x) { return x - mean; });
+    double sq_sum =
+        std::inner_product(diff.begin(), diff.end(), diff.begin(), 0.0);
+    double stdev = std::sqrt(sq_sum / (v.size()-1));
+    double ci = 1.96* stdev / std::sqrt((double)v.size());
     // TODO: include median
-    Stats statobj(mean, 0.0, stdev);
+    Stats statobj(mean, 0.0, stdev, ci);
     ret.push_back(statobj);
   }
   return ret;
 }
-
+/*
 vector<string> getFilesInDirectory(string dirstr) {
   DIR *dir;
   vector<string> ret;
   struct dirent *ent;
   if ((dir = opendir(dirstr.c_str())) != NULL) {
-    /* print all the files and directories within directory */
     while ((ent = readdir(dir)) != NULL) {
       string str = string(ent->d_name);
       if (str.size() > 3) {
@@ -138,11 +181,10 @@ vector<string> getFilesInDirectory(string dirstr) {
     }
     closedir(dir);
   } else {
-    /* could not open directory */
     perror("");
   }
   return ret;
-}
+}*/
 
 struct intermediateResultValue {
   intermediateResultValue(double a, size_t b, size_t c, double d, double e)
@@ -174,42 +216,289 @@ string BASEDIRECTORY;
 int NUMREPS;
 int WARMUPREPS;
 
-static double Util_getTime() {
-  struct timeval t;
-  struct timezone tzp;
-  gettimeofday(&t, &tzp);
-  return t.tv_sec + t.tv_usec * 1e-6;
+#define FILENAMES_LIMIT (1000000)
+#define MIN_FILENAME_LENGTH (1)
+
+/* Util*/
+static double Util_getTime()
+{
+    struct timeval t;
+    struct timezone tzp;
+    gettimeofday(&t, &tzp);
+    return t.tv_sec + t.tv_usec*1e-6;
+}
+static char* Util_concat(char* a, char* b)
+{
+    char* c = (char*) malloc(strlen(a) + strlen(b) + 1);
+    strcpy(c, a);
+    strcat(c, b);
+    return c;
+}
+static size_t Util_fileNamesFromDirPath(char* dirPath, char** fileNames)
+{
+    struct dirent* entry;
+    DIR* dir = opendir(dirPath);
+    size_t nbFileNames = 0;
+    while ((entry = readdir(dir)) && nbFileNames < FILENAMES_LIMIT) {
+        if (strlen(entry->d_name) > MIN_FILENAME_LENGTH) {
+            fileNames[nbFileNames++] = Util_concat(dirPath, entry->d_name);
+        }
+    }
+    closedir(dir);
+    return nbFileNames;
+}
+static size_t Util_fileSize(char* fileName) {
+    FILE* f = fopen(fileName, "r");
+    fseek(f, 0, SEEK_END);
+    size_t size = ftell(f);
+    fclose(f);
+    return size;
+}
+static void Util_readFile(char* fileName, void* buffer, size_t size)
+{
+    FILE* f = fopen(fileName, "r");
+    fread(buffer, sizeof(char), size, f);
+    fclose(f);
+}
+static void Util_initCompressionBuffers(char** fileNames,
+    size_t nbFileNames, void** dstBuffers, size_t* dstCapacities,
+    void** srcBuffers, size_t* srcSizes)
+{
+    size_t i;
+    for (i = 0; i < nbFileNames; ++i) {
+        srcSizes[i] = Util_fileSize(fileNames[i]);
+        srcBuffers[i] = (char*)malloc(sizeof(char) * srcSizes[i]);
+        Util_readFile(fileNames[i], srcBuffers[i], srcSizes[i]);
+        dstCapacities[i] = ZSTD_compressBound(srcSizes[i]);
+        dstBuffers[i] = (char*)malloc(sizeof(char) * dstCapacities[i]);
+    }
 }
 
-static size_t UTIL_fileSize(const char *fileName) {
-  FILE *f = fopen(fileName, "r");
-  fseek(f, 0, SEEK_END);
-  size_t size = ftell(f);
-  fclose(f);
-  return size;
+/* Create */
+static BenchContext* BenchContext_create(char* dirPath)
+{
+    if (dirPath == NULL) return NULL;
+    BenchContext* benchContext = (BenchContext*) malloc(sizeof(BenchContext));
+    benchContext->fileNames = (char**)malloc(sizeof(char*) * 1000000);
+    benchContext->nbFileNames = Util_fileNamesFromDirPath(dirPath,
+        benchContext->fileNames);
+
+    benchContext->dstBuffers = (void**)malloc(sizeof(void*) * benchContext->nbFileNames);
+    benchContext->dstCapacities = (size_t*)malloc(sizeof(size_t) * benchContext->nbFileNames);
+    benchContext->srcBuffers = (void**)malloc(sizeof(void*) * benchContext->nbFileNames);
+    benchContext->srcSizes = (size_t*)malloc(sizeof(size_t) * benchContext->nbFileNames);
+    Util_initCompressionBuffers(benchContext->fileNames,
+        benchContext->nbFileNames, benchContext->dstBuffers,
+        benchContext->dstCapacities, benchContext->srcBuffers,
+        benchContext->srcSizes);
+    size_t i;
+    size_t size = 0;
+    for (i = 0; i < benchContext->nbFileNames; ++i) {
+        size += benchContext->srcSizes[i];
+    }
+    benchContext->totalSrcSize = size;
+    return benchContext;
 }
 
-static void Util_readFile(const char *fileName, void *buffer, size_t size) {
-  FILE *f = fopen(fileName, "r");
-  fread(buffer, sizeof(char), size, f);
-  fclose(f);
+/* Free */
+static void BenchContext_freeFileNames(char** fileNames, size_t nbFileNames)
+{
+    size_t i;
+    for (i = 0; i < nbFileNames; ++i) {
+        free(fileNames[i]);
+    }
+    free(fileNames);
+}
+static void BenchContext_freeCompressionBuffers(void** dstBuffers,
+    size_t* dstCapacities, void** srcBuffers, size_t* srcSizes, size_t nbFileNames)
+{
+    size_t i;
+    for (i = 0; i < nbFileNames; ++i) {
+        free(dstBuffers[i]);
+        free(srcBuffers[i]);
+    }
+    free(dstBuffers);
+    free(dstCapacities);
+    free(srcBuffers);
+    free(srcSizes);
+}
+static void BenchContext_free(BenchContext* benchContext)
+{
+    if (benchContext == NULL) return;
+    BenchContext_freeFileNames(benchContext->fileNames,
+        benchContext->nbFileNames);
+    BenchContext_freeCompressionBuffers(benchContext->dstBuffers,
+        benchContext->dstCapacities, benchContext->srcBuffers,
+        benchContext->srcSizes, benchContext->nbFileNames);
+    free(benchContext);
 }
 
-void fileToBufs(string baseFilename, int dictSize, char *databuf,
-                char *dictbuf) {}
+static bool NODICT = false;
 
-void saveResults(const char *savefile) {
-  cout << "Saving results..." << endl;
-  for (const auto &each : CONSOLIDATEDRESULTS) {
-    size_t dictSize = each.first.first;
-    int compLevel = each.first.second;
-    double mbps = each.second[3];
-    double ratio = each.second[4];
-    printf("At dictisze:%lu, compLevel:%s -> %lf mbps, %lf ratio, \n", dictSize,
-           compLevel, mbps, ratio);
+#define MAX_FILENAMES 100000
+
+
+void benchWarmups(BenchContext* benchContext, void* dictBuf, size_t dictSize, int compLevel) {
+  auto cctx = ZSTD_createCCtx();
+  auto cdict = ZSTD_createCDict(dictBuf, dictSize, compLevel);
+  for (int u = 1; u <= WARMUPREPS; ++u) {
+    vector<double> statsForThisDirectoryInOneRun(5, 0.0);
+    size_t totalCompressedSize = 0, totalSrcSize = benchContext->totalSrcSize;
+    double timeBefore, timeElapsed;
+    if (NODICT) {
+      size_t i = 0;
+      timeBefore = Util_getTime();
+      for (; i < benchContext->nbFileNames; ++i) {
+        totalCompressedSize += ZSTD_compressCCtx(cctx, benchContext->dstBuffers[i],
+                              benchContext->dstCapacities[i],
+                              benchContext->srcBuffers[i],
+                              benchContext->srcSizes[i], compLevel);
+      }
+      timeElapsed = Util_getTime() - timeBefore;
+    } else {
+      size_t i = 0;
+      timeBefore = Util_getTime();
+      for (; i < benchContext->nbFileNames; ++i) {
+        totalCompressedSize += ZSTD_compress_usingCDict(cctx,
+                              benchContext->dstBuffers[i],
+                              benchContext->dstCapacities[i],
+                              benchContext->srcBuffers[i],
+                              benchContext->srcSizes[i],
+                              cdict);
+      }
+      timeElapsed = Util_getTime() - timeBefore;
+    }
+  }
+  ZSTD_freeCCtx(cctx);
+  ZSTD_freeCDict(cdict);
+}
+
+vector<Stats> benchADirectory(BenchContext* benchContext, void* dictBuf, size_t dictSize, int compLevel) {
+  // a bunch of reps to get our stats results
+  vector<double> totalTimes;
+  vector<double> compSizes;
+  vector<double> srcSizes;
+  vector<double> mbpses;
+  vector<double> ratios;
+  auto cctx = ZSTD_createCCtx();
+  auto cdict = ZSTD_createCDict(dictBuf, dictSize, compLevel);
+  benchWarmups(benchContext, dictBuf, dictSize, compLevel);
+  for (int u = 1; u <= NUMREPS; ++u) {
+    vector<double> statsForThisDirectoryInOneRun(5, 0.0);
+    size_t totalCompressedSize = 0, totalSrcSize = benchContext->totalSrcSize;
+    double timeBefore, timeElapsed;
+    if (NODICT) {
+      size_t i = 0;
+      timeBefore = Util_getTime();
+      for (; i < benchContext->nbFileNames; ++i) {
+        totalCompressedSize += ZSTD_compressCCtx(cctx, benchContext->dstBuffers[i],
+                              benchContext->dstCapacities[i],
+                              benchContext->srcBuffers[i],
+                              benchContext->srcSizes[i], compLevel);
+      }
+      timeElapsed = Util_getTime() - timeBefore;
+    } else {
+      size_t i = 0;
+      timeBefore = Util_getTime();
+      for (; i < benchContext->nbFileNames; ++i) {
+        totalCompressedSize += ZSTD_compress_usingCDict(cctx,
+                              benchContext->dstBuffers[i],
+                              benchContext->dstCapacities[i],
+                              benchContext->srcBuffers[i],
+                              benchContext->srcSizes[i],
+                              cdict);
+      }
+      timeElapsed = Util_getTime() - timeBefore;
+    }
+    totalTimes.push_back((double)timeElapsed);
+    compSizes.push_back((double)totalCompressedSize);
+    srcSizes.push_back((double)totalSrcSize);
+    mbpses.push_back((double)totalSrcSize / 1000000 / timeElapsed);
+    ratios.push_back((double)totalSrcSize / (double)totalCompressedSize);
+  }
+  ZSTD_freeCCtx(cctx);
+  ZSTD_freeCDict(cdict);
+  auto aggResults =
+      computeStats(compSizes, srcSizes, totalTimes, mbpses, ratios);
+  //printStats(aggResults, false);
+  return aggResults;
+}
+
+void writeToAFile(string location, int filesize, int res, vector<Stats> stats) {
+  ofstream myfile;
+  myfile.open(location.c_str(), ios::app);
+  myfile << filesize << "," << stats[res].mean << "," << stats[res].ci
+         << "\n";
+}
+
+void writeToAFileRatio(string location, int filesize, int res, vector<Stats> stats) {
+  ofstream myfile;
+  myfile.open(location.c_str(), ios::app);
+  myfile << filesize << "," << stats[res].mean << "\n";
+}
+
+void benchParallel(const char* locationToSave, bool dict, string baseFilename) {
+  string locationTosv = locationToSave;
+  cout << "Working on: " << baseFilename << endl;
+  for (auto dictSize : DICTSIZES) {
+      //cout << "dictSize: " << dictSize << endl;
+      string fulldictpath = BASEDIRECTORY + std::string("/dicts2/") + baseFilename +
+          "dict" + to_string(dictSize);
+      char *dictbuf = new char[dictSize];
+      char *pathbuf = strdup(fulldictpath.c_str());
+      Util_readFile(pathbuf, dictbuf, dictSize);
+
+      for (auto compLevel : COMPLEVELS) {
+        //cout << "compLevel: " << compLevel << endl;
+        for (auto filesize : FILESIZES) {
+          //cout << "filesize: " << filesize << endl;
+          string dirname = BASEDIRECTORY + string("data/") + baseFilename +
+                           to_string(filesize) + string("/");
+          char *dirbuf = strdup(dirname.c_str());
+          auto bc = BenchContext_create(dirbuf);
+          auto res = benchADirectory(bc, dictbuf, dictSize, compLevel);
+          // save the results
+          writeToAFile(locationTosv + baseFilename + "_" + to_string(dictSize) + "_" + to_string(compLevel) + "_" + "mbps", filesize, 3, res);
+          writeToAFileRatio(locationTosv + baseFilename + "_" + to_string(dictSize) + "_" + to_string(compLevel) + "_" + "ratio", filesize, 4, res);
+          BenchContext_free(bc);
+          free(dirbuf);
+        }
+      }
+
+      delete[] pathbuf;
+      free(dictbuf);
   }
 }
 
+void benchAll(const char *locationToSave, bool dict) {
+  // results are: file, filesize, dictsize, compressionlevel -> compSize,
+  // srcSize, totalTime, mbps, ratio
+  
+  vector<thread> threads;
+  for (const auto& each : BASEFILES) {
+    threads.push_back(thread([=]() { return benchParallel(locationToSave, dict, each); }));
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+}
+
+int main(int argc, char **argv) {
+  if (strlen(argv[5]) > 2) {
+    NODICT = true;
+  }
+  cout << "Benchmarking...\n";
+  cout << "Doing " << argv[1] << " warmup repetitions\n";
+  cout << "Doing " << argv[2] << " benchmark repetitions\n";
+  WARMUPREPS = stoi(argv[1]);
+  NUMREPS = stoi(argv[2]);
+  BASEDIRECTORY = argv[3];
+  benchAll(argv[4], false);
+  // saveResults(argv[4]);
+}
+
+/*
 void consolidateResults() {
   cout << "Consolidating..." << endl;
   size_t allTotalSize = 0;
@@ -245,139 +534,4 @@ void consolidateResults() {
     cout << "size: " << each.first.first << " level: " << each.first.second
          << " --- " << mbps << " mbps, and " << ratio << " ratio" << endl;
   }
-}
-
-void benchOneFile(string basefilename, string fullfilepath, size_t dictsize, int compLevel, vector<double>& rawCompSize, vector<double>& rawSrcSize, vector<double>& rawTotalTime, vector<double>& rawMbps, vector<double>& rawRatio) {
-
-  // full data and dict buffers=
-  size_t datasize = UTIL_fileSize(fullfilepath.c_str());
-  char *databuf = new char[datasize];
-  Util_readFile(fullfilepath.c_str(), databuf, datasize);
-
-  string fulldictpath = BASEDIRECTORY + std::string("/dicts/") + basefilename +
-                        "dict" + to_string(dictsize);
-  char *dictbuf = new char[dictsize];
-  Util_readFile(fulldictpath.c_str(), dictbuf, dictsize);
-
-  // begin compressions
-  ZSTD_CDict *cdict = ZSTD_createCDict(dictbuf, dictsize, compLevel);
-  ZSTD_CCtx *cctx = ZSTD_createCCtx();
-  vector<double> compCollection, srcCollection, timeCollection, mbpsCollection, ratioCollection;
-  double totalTime, timeBefore, timeIncrement;
-  size_t i = 1, compressedSize, compressedSizeTotal = 0, srcSizeTotal = 0;
-  for (; i <= NUMREPS; ++i) {
-    size_t dstsize = ZSTD_compressBound(datasize);
-    char *dstbuf = new char[dstsize];
-    timeBefore = Util_getTime();
-    compressedSize = ZSTD_compress_usingCDict(cctx, dstbuf, dstsize, databuf,
-                                              datasize, cdict);
-    timeIncrement = Util_getTime() - timeBefore;
-
-    if (i > WARMUPREPS) {
-      timeCollection.push_back(timeIncrement);
-      compCollection.push_back((double)compressedSize);
-      srcCollection.push_back((double)datasize);
-      mbpsCollection.push_back((double)datasize/1000000/timeIncrement);
-      ratioCollection.push_back((double)datasize/(double)compressedSize);
-    }
-    delete[] dstbuf;
-  }
-
-  auto stats = computeStats(compCollection, srcCollection, timeCollection, mbpsCollection, ratioCollection);
-  auto compMean = stats[0].mean;
-  auto srcMean = stats[1].mean;
-  auto timeMean = stats[2].mean;
-  auto mbps = stats[3].mean;
-  auto ratio = stats[4].mean;
-
-  rawCompSize.push_back(compMean);
-  rawSrcSize.push_back(srcMean);
-  rawTotalTime.push_back(timeMean);
-  rawMbps.push_back(mbps);
-  rawRatio.push_back(ratio);
-  // average out all the runs
-  //totalTime = totalTime / (NUMREPS - WARMUPREPS); // avg time to compress
-  //compressedSizeTotal = compressedSizeTotal / (NUMREPS - WARMUPREPS);
-  //srcSizeTotal = srcSizeTotal / (NUMREPS - WARMUPREPS);
-  //rawCompSize.push_back(compressedSizeTotal);
-  //rawSrcSize.push_back(srcSizeTotal);
-  //rawTotalTime.push_back(totalTime);
-  // compressedSize will always be the same for given dictsize/complevel, so we
-  // just use the last one just for fun
-  //double mbps = (double)datasize / 1000000 / totalTime;
-  //double ratio = (double)datasize / compressedSize;
-
-  //intermediateResultValue val(mbps, compressedSize, datasize, ratio, totalTime);
-  //tuple<string, size_t, int> key = make_tuple(fullfilepath, dictsize, compLevel);
-  //SEPARATERESULTS.emplace(key, val);
-
-  delete[] databuf;
-  delete[] dictbuf;
-  ZSTD_freeCCtx(cctx);
-  ZSTD_freeCDict(cdict);
-}
-
-vector<Stats> benchADirectory(string dirname, string baseFilename, size_t dictSize, int compLevel) {
-  vector<string> files = getFilesInDirectory(dirname);
-  vector<double> rawCompSize; // compSizeTotal, srcSizeTotal, totalTimeTaken
-  vector<double> rawSrcSize;
-  vector<double> rawTotalTime;
-  vector<double> rawMbps;
-  vector<double> rawRatio;
-  for (auto filename : files) {
-    string fullfilepath = dirname + filename;
-    benchOneFile(baseFilename, fullfilepath, dictSize, compLevel, rawCompSize, rawSrcSize, rawTotalTime, rawMbps, rawRatio);
-  }
-
-  auto stats = computeStats(rawCompSize, rawSrcSize, rawTotalTime, rawMbps, rawRatio);
-
-  // TODO: make this printing into a function
-  for (int i = 0; i < stats.size(); ++i) {
-    if (i == 0) {
-      cout << "compressedSize: ";
-      stats[i].print();
-    } else if (i == 1) {
-      cout << "srcSize: ";
-      stats[i].print();
-    } else if (i == 2) {
-      cout << "timeSpent: ";
-      stats[i].print();
-    } else if (i == 3) {
-      cout << "MBPS: ";
-      stats[i].print();
-    } else {
-      cout << "RATIO: ";
-      stats[i].print();
-    }
-  }
-  return stats;
-}
-
-void benchAll() {
-  for (auto baseFilename : BASEFILES) {
-    cout << baseFilename << endl;
-    for (auto dictSize : DICTSIZES) {
-      cout << dictSize << endl;
-      for (auto compLevel : COMPLEVELS) {
-        cout << compLevel << endl;
-        for (auto filesize : FILESIZES) {
-          string dirname = BASEDIRECTORY + string("/data/") + baseFilename + to_string(filesize) + string("/");
-          cout << dirname;
-          benchADirectory(dirname, baseFilename, dictSize, compLevel);
-        }
-      }
-    }
-  }
-  //consolidateResults();
-}
-
-int main(int argc, char **argv) {
-  cout << "Benchmarking...\n";
-  cout << "Doing " << argv[1] << " warmup repetitions\n";
-  cout << "Doing " << argv[2] << " benchmark repetitions\n";
-  WARMUPREPS = stoi(argv[1]);
-  NUMREPS = stoi(argv[2]);
-  BASEDIRECTORY = argv[3];
-  benchAll();
-  saveResults(argv[4]);
-}
+}*/
