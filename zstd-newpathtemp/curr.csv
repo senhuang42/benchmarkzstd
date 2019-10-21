@@ -1,0 +1,2 @@
+ZSTD_compress,ZSTD_compressCCtx_reuse,ZSTD_compressCCtx_recreate,ZSTD_compressStream_reuse_withSize,ZSTD_compressStream_recreate_withSize,ZSTD_compressStream_reuse_noSize,ZSTD_compressStream_recreate_noSize
+0.068007,0.059726,0.062435,0.013514,0.026945,0.012077,0.024423

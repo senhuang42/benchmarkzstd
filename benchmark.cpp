@@ -5,7 +5,7 @@
 #define ZDICT_STATIC_LINKING_ONLY
 #endif
 
-#include "zstd-finalnewpath/lib/zstd.h"
+#include "/Users/senhuang96/Desktop/zstd/lib/zstd.h"
 #include <algorithm>
 #include <dirent.h>
 #include <fstream>
@@ -23,48 +23,54 @@
 #include <vector>
 #include <thread>
 // g++ -std=c++11 benchmark.cpp zstd-baseline/lib/libzstd.a -o zstdbase && g++ -std=c++11 benchmark.cpp zstd-finalnewpath/lib/libzstd.a -o zstdnew
+// g++ -std=c++11 benchmark.cpp zstd-baseline/lib/libzstd.a -lpthread -o zstdbase && g++ -std=c++11 benchmark.cpp zstd-finalnewpath/lib/libzstd.a -lpthread -o zstdnew
+// (./zstdbase 1 15 ~/bench/ ~/bench/results/zstdold/ ye & ./zstdnew 1 15 ~/bench/ ~/bench/results/zstdnew/ ye & ./zstdbase 1 15 ~/bench/ ~/bench/results/zstdnodict/ yes) && python dataprocess.py
+// ./zstdbase 1 20 ~/bench/ ~/bench/results/zstdold/ ye && ./zstdnew 1 20 ~/bench/ ~/bench/results/zstdnew/ ye && ./zstdbase 1 20 ~/bench/ ~/bench/results/zstdnodict/ yes && python dataprocess.py
+
+// g++ -std=c++11 benchmark.cpp zstd-baseline/lib/libzstd.a -o zstdbase && g++ -std=c++11 benchmark.cpp ~/desktop/zstd/lib/libzstd.a -o zstdye
+// ./zstdye 1 3 ~/bench/ /dev/null ye && ./zstdbase 1 3 ~/bench/ /dev/null ye && ./zstdbase 1 3 ~/bench/ /dev/null yes
+
 
 using namespace std;
-
 vector<string> BASEFILES = {
     "dickens",
-    "mozilla",
-    "mr",
+    //"mozilla",
+    /*"mr",
     "nci",
-    "ooffice",
-    "osdb",
+    "ooffice",*/
+    /*"osdb",
     "samba",
     "reymont",
     "webster",
     "sao",
     "xml",
-    "x-ray"
+    "x-ray"*/
 };
 vector<int> DICTSIZES = {
     2000,
-    8000,
-    16000,
-    32000,
-    48000,
-    64000,
-    86000,
-    112640,
-    140000,
-    180000
+    //8000,
+    //16000,
+    //32000,
+    //48000,
+    //64000,
+    //86000,
+    //112640,
+    //140000,
+    //180000
 };
-vector<int> COMPLEVELS = {1, 2, 3, 4, 5};
+vector<int> COMPLEVELS = {1};
 
 vector<int> FILESIZES = {
     16000,
-    32000,
-    64000,
-    128000,
-    256000,
-    512000,
-    1000000,
-    2000000,
-    4000000,
-    6000000
+    //32000,
+    //64000,
+    //128000,
+    //256000,
+    //512000,
+    //1000000,
+    //2000000,
+    //4000000,
+    //6000000
 };
 
 namespace std {
@@ -107,10 +113,11 @@ struct BenchContext{
 };
 
 struct Stats {
-  Stats(double mean, double median, double stddev, double ci)
-      : mean(mean), median(median), stddev(stddev), ci(ci) {}
+  Stats(double mean, double median, double p90, double stddev, double ci)
+      : mean(mean), median(median), p90(p90), stddev(stddev), ci(ci) {}
   double mean;
   double median;
+  double p90;
   double stddev;
   double ci;
   void print() { cout << "mean: " << mean << " stddev: " << stddev << " ci: " << ci << endl; }
@@ -161,8 +168,10 @@ vector<Stats> computeStats(const vector<double> &compressedSizes,
         std::inner_product(diff.begin(), diff.end(), diff.begin(), 0.0);
     double stdev = std::sqrt(sq_sum / (v.size()-1));
     double ci = 1.96* stdev / std::sqrt((double)v.size());
-    // TODO: include median
-    Stats statobj(mean, 0.0, stdev, ci);
+    sort(v.begin(), v.end());
+    double median = v[v.size()/2];
+    double p90 = v[(int)(v.size()*0.9)];
+    Stats statobj(mean, median, p90, stdev, ci);
     ret.push_back(statobj);
   }
   return ret;
@@ -381,7 +390,10 @@ vector<Stats> benchADirectory(BenchContext* benchContext, void* dictBuf, size_t 
   vector<double> mbpses;
   vector<double> ratios;
   auto cctx = ZSTD_createCCtx();
-  auto cdict = ZSTD_createCDict(dictBuf, dictSize, compLevel);
+  //auto cdict = ZSTD_createCDict(dictBuf, dictSize, compLevel);
+  auto cParams = ZSTD_getCParams(compLevel, 0, dictSize);
+  auto cdict = ZSTD_createCDict_advanced(dictBuf, dictSize, ZSTD_dlm_byCopy, ZSTD_dct_auto, cParams, ZSTD_defaultCMem);
+  ZSTD_CCtx_setParameter(cctx, ZSTD_c_forceAttachDict, ZSTD_dictForceSource);
   benchWarmups(benchContext, dictBuf, dictSize, compLevel);
   for (int u = 1; u <= NUMREPS; ++u) {
     vector<double> statsForThisDirectoryInOneRun(5, 0.0);
@@ -420,15 +432,15 @@ vector<Stats> benchADirectory(BenchContext* benchContext, void* dictBuf, size_t 
   ZSTD_freeCDict(cdict);
   auto aggResults =
       computeStats(compSizes, srcSizes, totalTimes, mbpses, ratios);
-  //printStats(aggResults, false);
+  printStats(aggResults, false);
   return aggResults;
 }
 
 void writeToAFile(string location, int filesize, int res, vector<Stats> stats) {
   ofstream myfile;
   myfile.open(location.c_str(), ios::app);
-  myfile << filesize << "," << stats[res].mean << "," << stats[res].ci
-         << "\n";
+  myfile << filesize << "," << stats[res].mean << "," << stats[res].ci << "," << stats[res].stddev
+         << "," << stats[res].median << "," << stats[res].p90 << "\n";
 }
 
 void writeToAFileRatio(string location, int filesize, int res, vector<Stats> stats) {
@@ -473,7 +485,7 @@ void benchParallel(const char* locationToSave, bool dict, string baseFilename) {
 void benchAll(const char *locationToSave, bool dict) {
   // results are: file, filesize, dictsize, compressionlevel -> compSize,
   // srcSize, totalTime, mbps, ratio
-  
+
   vector<thread> threads;
   for (const auto& each : BASEFILES) {
     threads.push_back(thread([=]() { return benchParallel(locationToSave, dict, each); }));
